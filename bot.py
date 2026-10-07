@@ -6,11 +6,13 @@ import os
 import re
 import sqlite3
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 import wave
 from collections import defaultdict
 
 import discord
+from discord import app_commands
 from discord.ext import commands, voice_recv
 from dotenv import load_dotenv
 from faster_whisper import WhisperModel
@@ -59,6 +61,8 @@ PROFANITY_AND_SLURS = {
 }
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "database", "wigz.db")
+WATCHED_VOICE_CHANNEL_ID = 442196862607425536  # WHO
+LOCAL_TZ = ZoneInfo("America/Los_Angeles")
 _db_lock = threading.Lock()
 
 
@@ -125,6 +129,58 @@ def record_trigger(user_id: int, display_name: str, trigger: str,
             ),
         )
         conn.commit()
+
+
+def period_cutoff(period: str):
+    now_local = datetime.now(LOCAL_TZ)
+    if period == "today":
+        start = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    elif period == "week":
+        start = (now_local - timedelta(days=now_local.weekday())).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+    elif period == "month":
+        start = now_local.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    else:
+        return None
+    return start.astimezone(timezone.utc).isoformat()
+
+
+def period_where(period: str):
+    cutoff = period_cutoff(period)
+    if cutoff is None:
+        return "", []
+    return " AND occurred_at >= ?", [cutoff]
+
+
+async def ensure_watched_voice_state(guild: discord.Guild) -> None:
+    channel = guild.get_channel(WATCHED_VOICE_CHANNEL_ID)
+    if not isinstance(channel, discord.VoiceChannel):
+        return
+
+    humans = [member for member in channel.members if not member.bot]
+    voice_client = guild.voice_client
+
+    if humans:
+        try:
+            if voice_client is None:
+                voice_client = await channel.connect(
+                    cls=voice_recv.VoiceRecvClient,
+                    self_deaf=False,
+                )
+                start_voice_listener(voice_client)
+                print(f"[AUTO VOICE] Listening silently in {channel.name}")
+            elif isinstance(voice_client, voice_recv.VoiceRecvClient):
+                if voice_client.channel != channel:
+                    await voice_client.move_to(channel)
+                start_voice_listener(voice_client)
+        except Exception as exc:
+            print(f"[AUTO VOICE ERROR] {type(exc).__name__}: {exc}")
+    elif voice_client is not None and voice_client.channel.id == channel.id:
+        if isinstance(voice_client, voice_recv.VoiceRecvClient) and voice_client.is_listening():
+            voice_client.stop_listening()
+        await voice_client.disconnect()
+        print(f"[AUTO VOICE] {channel.name} empty; disconnected")
 
 
 def get_whisper_model():
@@ -296,6 +352,21 @@ async def on_ready():
     print("Wigz is online and ready.")
     print("=" * 45)
 
+    # If Wigz restarted while people were already in WHO, resume automatically.
+    for guild in bot.guilds:
+        await ensure_watched_voice_state(guild)
+
+
+@bot.event
+async def on_voice_state_update(member, before, after):
+    if member.bot:
+        return
+    before_id = before.channel.id if before.channel else None
+    after_id = after.channel.id if after.channel else None
+    if WATCHED_VOICE_CHANNEL_ID in (before_id, after_id):
+        await asyncio.sleep(0.75)
+        await ensure_watched_voice_state(member.guild)
+
 
 @bot.tree.command(name="join", description="Have Wigz join your current voice channel.")
 async def join(interaction: discord.Interaction):
@@ -352,7 +423,46 @@ async def join(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="score", description="Show a member's Wigz trigger score.")
-async def score(interaction: discord.Interaction, member: discord.Member | None = None):
+@app_commands.choices(period=[
+    app_commands.Choice(name="Today", value="today"),
+    app_commands.Choice(name="This week", value="week"),
+    app_commands.Choice(name="This month", value="month"),
+    app_commands.Choice(name="All time", value="all"),
+])
+async def score(
+    interaction: discord.Interaction,
+    member: discord.Member | None = None,
+    period: app_commands.Choice[str] | None = None,
+):
+    target = member or interaction.user
+    selected = period.value if period else "all"
+    extra_where, extra_params = period_where(selected)
+    with _db_lock, sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            f"""SELECT trigger, COUNT(*) AS count
+                FROM trigger_events
+                WHERE user_id = ? AND guild_id = ?{extra_where}
+                GROUP BY trigger
+                ORDER BY count DESC, trigger COLLATE NOCASE""",
+            [target.id, interaction.guild_id, *extra_params],
+        ).fetchall()
+
+    total = sum(count for _, count in rows)
+    label = {"today":"Today","week":"This week","month":"This month","all":"All time"}[selected]
+    if not rows:
+        await interaction.response.send_message(
+            f"**{target.display_name}** has no Wigz trigger points for **{label}**."
+        )
+        return
+
+    breakdown = "\n".join(f"• {trigger.title()}: **{count}**" for trigger, count in rows)
+    await interaction.response.send_message(
+        f"📊 **{target.display_name} — {total} total ({label})**\n{breakdown}"
+    )
+
+
+@bot.tree.command(name="stats", description="Show detailed Wigz stats for a member.")
+async def stats(interaction: discord.Interaction, member: discord.Member | None = None):
     target = member or interaction.user
     with _db_lock, sqlite3.connect(DB_PATH) as conn:
         rows = conn.execute(
@@ -363,59 +473,82 @@ async def score(interaction: discord.Interaction, member: discord.Member | None 
                ORDER BY count DESC, trigger COLLATE NOCASE""",
             (target.id, interaction.guild_id),
         ).fetchall()
+        total = sum(count for _, count in rows)
+        today_cutoff = period_cutoff("today")
+        week_cutoff = period_cutoff("week")
+        month_cutoff = period_cutoff("month")
+        today = conn.execute(
+            "SELECT COUNT(*) FROM trigger_events WHERE user_id=? AND guild_id=? AND occurred_at>=?",
+            (target.id, interaction.guild_id, today_cutoff),
+        ).fetchone()[0]
+        week = conn.execute(
+            "SELECT COUNT(*) FROM trigger_events WHERE user_id=? AND guild_id=? AND occurred_at>=?",
+            (target.id, interaction.guild_id, week_cutoff),
+        ).fetchone()[0]
+        month = conn.execute(
+            "SELECT COUNT(*) FROM trigger_events WHERE user_id=? AND guild_id=? AND occurred_at>=?",
+            (target.id, interaction.guild_id, month_cutoff),
+        ).fetchone()[0]
 
-    total = sum(count for _, count in rows)
     if not rows:
-        await interaction.response.send_message(
-            f"**{target.display_name}** has no Wigz trigger points yet."
-        )
+        await interaction.response.send_message(f"**{target.display_name}** has no Wigz stats yet.")
         return
 
-    breakdown = "\n".join(
-        f"• {trigger.title()}: **{count}**" for trigger, count in rows
-    )
+    favorite, favorite_count = rows[0]
     await interaction.response.send_message(
-        f"📊 **{target.display_name} — {total} total**\n{breakdown}"
+        f"📈 **{target.display_name} — Wigz Stats**\n"
+        f"Today: **{today}** • Week: **{week}** • Month: **{month}** • All time: **{total}**\n"
+        f"Top trigger: **{favorite.title()}** ({favorite_count})"
     )
 
 
 @bot.tree.command(name="leaderboard", description="Show the Wigz trigger leaderboard.")
-async def leaderboard(interaction: discord.Interaction):
+@app_commands.choices(period=[
+    app_commands.Choice(name="Today", value="today"),
+    app_commands.Choice(name="This week", value="week"),
+    app_commands.Choice(name="This month", value="month"),
+    app_commands.Choice(name="All time", value="all"),
+])
+async def leaderboard(
+    interaction: discord.Interaction,
+    period: app_commands.Choice[str] | None = None,
+):
+    selected = period.value if period else "all"
+    extra_where, extra_params = period_where(selected)
+    label = {"today":"Today","week":"This week","month":"This month","all":"All time"}[selected]
+
     with _db_lock, sqlite3.connect(DB_PATH) as conn:
         rows = conn.execute(
-            """SELECT user_id, MAX(display_name), COUNT(*) AS score
-               FROM trigger_events
-               WHERE guild_id = ?
-               GROUP BY user_id
-               ORDER BY score DESC, MAX(display_name) COLLATE NOCASE
-               LIMIT 10""",
-            (interaction.guild_id,),
+            f"""SELECT user_id, MAX(display_name), COUNT(*) AS score
+                FROM trigger_events
+                WHERE guild_id = ?{extra_where}
+                GROUP BY user_id
+                ORDER BY score DESC, MAX(display_name) COLLATE NOCASE
+                LIMIT 10""",
+            [interaction.guild_id, *extra_params],
         ).fetchall()
 
-    if not rows:
-        await interaction.response.send_message("No Wigz trigger scores yet.")
-        return
-
-    sections = []
-    with _db_lock, sqlite3.connect(DB_PATH) as conn:
+        sections = []
         for index, (user_id, name, points) in enumerate(rows, start=1):
             breakdown_rows = conn.execute(
-                """SELECT trigger, COUNT(*) AS count
-                   FROM trigger_events
-                   WHERE user_id = ? AND guild_id = ?
-                   GROUP BY trigger
-                   ORDER BY count DESC, trigger COLLATE NOCASE""",
-                (user_id, interaction.guild_id),
+                f"""SELECT trigger, COUNT(*) AS count
+                    FROM trigger_events
+                    WHERE user_id = ? AND guild_id = ?{extra_where}
+                    GROUP BY trigger
+                    ORDER BY count DESC, trigger COLLATE NOCASE""",
+                [user_id, interaction.guild_id, *extra_params],
             ).fetchall()
             breakdown = " • ".join(
                 f"{trigger.title()}: {count}" for trigger, count in breakdown_rows
             )
-            sections.append(
-                f"**{index}. {name} — {points} total**\n{breakdown}"
-            )
+            sections.append(f"**{index}. {name} — {points} total**\n{breakdown}")
+
+    if not rows:
+        await interaction.response.send_message(f"No Wigz trigger scores for **{label}** yet.")
+        return
 
     await interaction.response.send_message(
-        "🏆 **Wigz Leaderboard**\n\n" + "\n\n".join(sections)
+        f"🏆 **Wigz Leaderboard — {label}**\n\n" + "\n\n".join(sections)
     )
 
 
