@@ -158,33 +158,41 @@ def period_where(period: str):
 
 
 async def ensure_watched_voice_state(guild: discord.Guild) -> None:
+    """Keep Wigz silently connected to WHO while the bot is online."""
     channel = guild.get_channel(WATCHED_VOICE_CHANNEL_ID)
     if not isinstance(channel, discord.VoiceChannel):
         return
 
-    humans = [member for member in channel.members if not member.bot]
     voice_client = guild.voice_client
+    try:
+        if voice_client is None:
+            voice_client = await channel.connect(
+                cls=voice_recv.VoiceRecvClient,
+                self_deaf=False,
+            )
+            start_voice_listener(voice_client)
+            print(f"[AUTO VOICE] Connected silently to {channel.name}; staying connected")
+        elif isinstance(voice_client, voice_recv.VoiceRecvClient):
+            if voice_client.channel != channel:
+                await voice_client.move_to(channel)
+            start_voice_listener(voice_client)
+    except Exception as exc:
+        print(f"[AUTO VOICE ERROR] {type(exc).__name__}: {exc}")
 
-    if humans:
-        try:
-            if voice_client is None:
-                voice_client = await channel.connect(
-                    cls=voice_recv.VoiceRecvClient,
-                    self_deaf=False,
-                )
-                start_voice_listener(voice_client)
-                print(f"[AUTO VOICE] Listening silently in {channel.name}")
-            elif isinstance(voice_client, voice_recv.VoiceRecvClient):
-                if voice_client.channel != channel:
-                    await voice_client.move_to(channel)
-                start_voice_listener(voice_client)
-        except Exception as exc:
-            print(f"[AUTO VOICE ERROR] {type(exc).__name__}: {exc}")
-    elif voice_client is not None and voice_client.channel.id == channel.id:
-        if isinstance(voice_client, voice_recv.VoiceRecvClient) and voice_client.is_listening():
-            voice_client.stop_listening()
-        await voice_client.disconnect()
-        print(f"[AUTO VOICE] {channel.name} empty; disconnected")
+
+def get_top_trigger(user_id: int, guild_id: int, period: str):
+    extra_where, extra_params = period_where(period)
+    with _db_lock, sqlite3.connect(DB_PATH) as conn:
+        return conn.execute(
+            f"""SELECT trigger, COUNT(*) AS count
+                FROM trigger_events
+                WHERE user_id = ? AND guild_id = ?
+                  AND trigger != 'profanity/slur'{extra_where}
+                GROUP BY trigger
+                ORDER BY count DESC, trigger COLLATE NOCASE
+                LIMIT 1""",
+            [user_id, guild_id, *extra_params],
+        ).fetchone()
 
 
 def get_whisper_model():
@@ -356,20 +364,9 @@ async def on_ready():
     print("Wigz is online and ready.")
     print("=" * 45)
 
-    # If Wigz restarted while people were already in WHO, resume automatically.
+    # Keep Wigz parked silently in WHO whenever the bot is online.
     for guild in bot.guilds:
         await ensure_watched_voice_state(guild)
-
-
-@bot.event
-async def on_voice_state_update(member, before, after):
-    if member.bot:
-        return
-    before_id = before.channel.id if before.channel else None
-    after_id = after.channel.id if after.channel else None
-    if WATCHED_VOICE_CHANNEL_ID in (before_id, after_id):
-        await asyncio.sleep(0.75)
-        await ensure_watched_voice_state(member.guild)
 
 
 @bot.tree.command(name="join", description="Have Wigz join your current voice channel.")
@@ -504,6 +501,10 @@ async def stats(interaction: discord.Interaction, member: discord.Member | None 
         await interaction.response.send_message(f"**{target.display_name}** has no Wigz stats yet.")
         return
 
+    top_today = get_top_trigger(target.id, interaction.guild_id, "today")
+    top_week = get_top_trigger(target.id, interaction.guild_id, "week")
+    top_month = get_top_trigger(target.id, interaction.guild_id, "month")
+
     favorite, favorite_count = rows[0]
     breakdown = "\n".join(f"**{trigger.title()}** — {count}" for trigger, count in rows[:10])
     embed = discord.Embed(
@@ -515,8 +516,23 @@ async def stats(interaction: discord.Interaction, member: discord.Member | None 
     embed.add_field(name="This month", value=f"**{month}**", inline=True)
     embed.add_field(name="All time", value=f"**{total}**", inline=True)
     embed.add_field(
-        name="🏅 Top trigger",
+        name="🏅 All-time favorite",
         value=f"**{favorite.title()}** — {favorite_count}",
+        inline=True,
+    )
+    embed.add_field(
+        name="☀️ Word of the day",
+        value=f"**{top_today[0].title()}** — {top_today[1]}" if top_today else "No triggers yet",
+        inline=True,
+    )
+    embed.add_field(
+        name="📅 Word of the week",
+        value=f"**{top_week[0].title()}** — {top_week[1]}" if top_week else "No triggers yet",
+        inline=True,
+    )
+    embed.add_field(
+        name="🗓️ Word of the month",
+        value=f"**{top_month[0].title()}** — {top_month[1]}" if top_month else "No triggers yet",
         inline=True,
     )
     embed.add_field(name="Top trigger breakdown", value=breakdown, inline=False)
