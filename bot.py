@@ -601,6 +601,79 @@ async def leaderboard(
     await interaction.response.send_message(embed=embed)
 
 
+@bot.tree.command(name="recap", description="Show today's server-wide Wigz recap.")
+async def recap(interaction: discord.Interaction):
+    cutoff = period_cutoff("today")
+
+    with _db_lock, sqlite3.connect(DB_PATH) as conn:
+        total = conn.execute(
+            """SELECT COUNT(*)
+               FROM trigger_events
+               WHERE guild_id = ? AND trigger != 'profanity/slur'
+                 AND occurred_at >= ?""",
+            (interaction.guild_id, cutoff),
+        ).fetchone()[0]
+
+        top_word = conn.execute(
+            """SELECT trigger, COUNT(*) AS count
+               FROM trigger_events
+               WHERE guild_id = ? AND trigger != 'profanity/slur'
+                 AND occurred_at >= ?
+               GROUP BY trigger
+               ORDER BY count DESC, trigger COLLATE NOCASE
+               LIMIT 1""",
+            (interaction.guild_id, cutoff),
+        ).fetchone()
+
+        leaders = conn.execute(
+            """SELECT user_id, MAX(display_name), COUNT(*) AS score
+               FROM trigger_events
+               WHERE guild_id = ? AND trigger != 'profanity/slur'
+                 AND occurred_at >= ?
+               GROUP BY user_id
+               ORDER BY score DESC, MAX(display_name) COLLATE NOCASE
+               LIMIT 3""",
+            (interaction.guild_id, cutoff),
+        ).fetchall()
+
+    embed = discord.Embed(
+        title="☀️ Wigz Daily Recap",
+        description="Today's server-wide chaos so far.",
+        color=discord.Color.gold(),
+        timestamp=datetime.now(timezone.utc),
+    )
+
+    embed.add_field(name="🎯 Total triggers", value=f"**{total}**", inline=True)
+
+    if top_word:
+        embed.add_field(
+            name="🗣️ Word of the Day",
+            value=f"**{top_word[0].title()}** — {top_word[1]}",
+            inline=True,
+        )
+    else:
+        embed.add_field(name="🗣️ Word of the Day", value="No triggers yet", inline=True)
+
+    if leaders:
+        embed.add_field(
+            name="👑 Today's #1",
+            value=f"**{leaders[0][1]}** — {leaders[0][2]}",
+            inline=True,
+        )
+        medals = ["🥇", "🥈", "🥉"]
+        standings = "\n".join(
+            f"{medals[index]} **{name}** — {points}"
+            for index, (_, name, points) in enumerate(leaders)
+        )
+        embed.add_field(name="🏆 Today's Top 3", value=standings, inline=False)
+    else:
+        embed.add_field(name="👑 Today's #1", value="Nobody yet", inline=True)
+        embed.add_field(name="🏆 Today's Top 3", value="No scores yet", inline=False)
+
+    embed.set_footer(text="Wigz • Daily stats reset at midnight Pacific")
+    await interaction.response.send_message(embed=embed)
+
+
 @bot.tree.command(name="leave", description="Disconnect Wigz from voice.")
 async def leave(interaction: discord.Interaction):
     if interaction.guild is None:
