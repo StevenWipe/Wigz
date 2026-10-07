@@ -90,6 +90,10 @@ DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "database", "
 WATCHED_VOICE_CHANNEL_ID = 442196862607425536  # WHO
 LOCAL_TZ = ZoneInfo("America/Los_Angeles")
 _db_lock = threading.Lock()
+AFK_INACTIVITY_MINUTES = 25
+AFK_THRESHOLD_SECONDS = AFK_INACTIVITY_MINUTES * 60
+_voice_activity_lock = threading.Lock()
+_voice_activity = {}
 
 
 def normalize_text(text: str) -> str:
@@ -136,6 +140,12 @@ def init_database() -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_trigger_events_user ON trigger_events(user_id)"
         )
+        conn.execute("""CREATE TABLE IF NOT EXISTS afk_sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
+            display_name TEXT NOT NULL, guild_id INTEGER NOT NULL, channel_id INTEGER NOT NULL,
+            afk_started_at TEXT NOT NULL, afk_ended_at TEXT NOT NULL, duration_seconds INTEGER NOT NULL
+        )""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_afk_sessions_user ON afk_sessions(user_id)")
         conn.commit()
 
 
@@ -155,6 +165,73 @@ def record_trigger(user_id: int, display_name: str, trigger: str,
             ),
         )
         conn.commit()
+
+
+def format_duration(seconds: int) -> str:
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes = remainder // 60
+    return f"{hours}h {minutes}m" if hours else f"{minutes}m"
+
+
+def finish_afk_session_locked(guild_id: int, user_id: int, ended_at: datetime) -> None:
+    state = _voice_activity.get((guild_id, user_id))
+    if not state or state["afk_started"] is None:
+        return
+    started = state["afk_started"]
+    duration = max(0, int((ended_at - started).total_seconds()))
+    with _db_lock, sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""INSERT INTO afk_sessions
+            (user_id, display_name, guild_id, channel_id, afk_started_at, afk_ended_at, duration_seconds)
+            VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (user_id, state["display_name"], guild_id, state["channel_id"],
+             started.isoformat(), ended_at.isoformat(), duration))
+        conn.commit()
+    print(f"[AFK] {state['display_name']} active again after {format_duration(duration)} AFK")
+    state["afk_started"] = None
+
+
+def note_voice_activity(member: discord.Member) -> None:
+    now = datetime.now(timezone.utc)
+    with _voice_activity_lock:
+        state = _voice_activity.setdefault((member.guild.id, member.id), {
+            "display_name": member.display_name, "channel_id": WATCHED_VOICE_CHANNEL_ID,
+            "last_spoke": now, "afk_started": None})
+        state["display_name"] = member.display_name
+        if state["afk_started"] is not None:
+            finish_afk_session_locked(member.guild.id, member.id, now)
+        state["last_spoke"] = now
+
+
+def close_voice_activity(member: discord.Member) -> None:
+    with _voice_activity_lock:
+        finish_afk_session_locked(member.guild.id, member.id, datetime.now(timezone.utc))
+        _voice_activity.pop((member.guild.id, member.id), None)
+
+
+async def afk_monitor_loop() -> None:
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        now = datetime.now(timezone.utc)
+        with _voice_activity_lock:
+            for state in _voice_activity.values():
+                if state["afk_started"] is None:
+                    threshold = state["last_spoke"] + timedelta(seconds=AFK_THRESHOLD_SECONDS)
+                    if now >= threshold:
+                        state["afk_started"] = threshold
+                        print(f"[AFK] {state['display_name']} marked AFK after {AFK_INACTIVITY_MINUTES}m silence")
+        await asyncio.sleep(30)
+
+
+def afk_period_stats(user_id: int, guild_id: int, period: str):
+    cutoff = period_cutoff(period)
+    where, params = "WHERE user_id=? AND guild_id=?", [user_id, guild_id]
+    if cutoff:
+        where += " AND afk_ended_at >= ?"
+        params.append(cutoff)
+    with _db_lock, sqlite3.connect(DB_PATH) as conn:
+        return conn.execute(f"""SELECT COALESCE(SUM(duration_seconds),0), COUNT(*),
+            COALESCE(MAX(duration_seconds),0) FROM afk_sessions {where}""", params).fetchone()
 
 
 def period_cutoff(period: str):
@@ -325,6 +402,7 @@ class TranscriptionSink(voice_recv.AudioSink):
         self.buffers[member.id] = bytearray()
         self.names[member.id] = member.display_name
         print(f"[SPEAKING] {member.display_name} started speaking")
+        note_voice_activity(member)
 
     @voice_recv.AudioSink.listener()
     def on_voice_member_speaking_stop(self, member):
@@ -384,6 +462,7 @@ async def setup_hook():
     print("Syncing slash commands...")
     synced = await bot.tree.sync()
     print(f"Synced {len(synced)} slash command(s).")
+    bot.loop.create_task(afk_monitor_loop())
 
 
 @bot.event
@@ -406,6 +485,32 @@ async def on_ready():
     # Keep Wigz parked silently in WHO whenever the bot is online.
     for guild in bot.guilds:
         await ensure_watched_voice_state(guild)
+        channel = guild.get_channel(WATCHED_VOICE_CHANNEL_ID)
+        if isinstance(channel, discord.VoiceChannel):
+            now = datetime.now(timezone.utc)
+            with _voice_activity_lock:
+                for member in channel.members:
+                    if not member.bot:
+                        _voice_activity[(guild.id, member.id)] = {
+                            "display_name": member.display_name, "channel_id": channel.id,
+                            "last_spoke": now, "afk_started": None}
+
+
+@bot.event
+async def on_voice_state_update(member, before, after):
+    if member.bot:
+        return
+    was_watched = before.channel is not None and before.channel.id == WATCHED_VOICE_CHANNEL_ID
+    is_watched = after.channel is not None and after.channel.id == WATCHED_VOICE_CHANNEL_ID
+    if not was_watched and is_watched:
+        with _voice_activity_lock:
+            _voice_activity[(member.guild.id, member.id)] = {
+                "display_name": member.display_name, "channel_id": after.channel.id,
+                "last_spoke": datetime.now(timezone.utc), "afk_started": None}
+        print(f"[AFK] Tracking {member.display_name}")
+    elif was_watched and not is_watched:
+        close_voice_activity(member)
+        print(f"[AFK] Stopped tracking {member.display_name}")
 
 
 @bot.tree.command(name="join", description="Have Wigz join your current voice channel.")
@@ -724,6 +829,66 @@ async def recap(interaction: discord.Interaction):
     embed.add_field(name="👑  TODAY'S MVP", value=mvp_text, inline=False)
     embed.add_field(name="🏆  TODAY'S PODIUM", value=standings, inline=False)
     embed.set_footer(text="WIGZ  •  Resets at midnight Pacific")
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="afk", description="Show a member's Wigz voice-inactivity stats.")
+async def afk(interaction: discord.Interaction, member: discord.Member | None = None):
+    target = member or interaction.user
+    today_seconds, _, _ = afk_period_stats(target.id, interaction.guild_id, "today")
+    week_seconds, _, _ = afk_period_stats(target.id, interaction.guild_id, "week")
+    month_seconds, _, _ = afk_period_stats(target.id, interaction.guild_id, "month")
+    all_seconds, all_trips, longest = afk_period_stats(target.id, interaction.guild_id, "all")
+    current = "⚪ **NOT CURRENTLY TRACKED**"
+    with _voice_activity_lock:
+        state = _voice_activity.get((interaction.guild_id, target.id))
+        if state:
+            now = datetime.now(timezone.utc)
+            silent = int((now - state["last_spoke"]).total_seconds())
+            if state["afk_started"]:
+                current_afk = int((now - state["afk_started"]).total_seconds())
+                current = f"💤 **WIGZ AFK** · {format_duration(current_afk)}\nLast spoke {format_duration(silent)} ago"
+            else:
+                current = f"🟢 **ACTIVE**\nLast spoke {format_duration(silent)} ago"
+    embed = discord.Embed(title="💤  W I G Z   •   A F K   R E P O R T",
+        description=f"## {target.display_name}\n{current}\n\n*AFK begins after {AFK_INACTIVITY_MINUTES} minutes without speaking.*",
+        color=discord.Color.gold())
+    embed.add_field(name="⏱️  AFK TIME", value=f"**TODAY**  {format_duration(today_seconds)}\n**THIS WEEK**  {format_duration(week_seconds)}\n**THIS MONTH**  {format_duration(month_seconds)}\n**ALL TIME**  {format_duration(all_seconds)}", inline=False)
+    embed.add_field(name="😴  LONGEST NAP", value=f"### {format_duration(longest)}", inline=True)
+    embed.add_field(name="🚪  AFK TRIPS", value=f"### {all_trips}", inline=True)
+    embed.set_thumbnail(url=member_avatar_url(target))
+    embed.set_footer(text="WIGZ • Voice inactivity tracker")
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="afkleaderboard", description="Rank members by Wigz AFK time.")
+@app_commands.choices(period=[
+    app_commands.Choice(name="Today", value="today"), app_commands.Choice(name="This week", value="week"),
+    app_commands.Choice(name="This month", value="month"), app_commands.Choice(name="All time", value="all")])
+async def afkleaderboard(interaction: discord.Interaction, period: app_commands.Choice[str] | None = None):
+    selected = period.value if period else "all"
+    cutoff = period_cutoff(selected)
+    where, params = "WHERE guild_id=?", [interaction.guild_id]
+    if cutoff:
+        where += " AND afk_ended_at >= ?"
+        params.append(cutoff)
+    with _db_lock, sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(f"""SELECT user_id, MAX(display_name), SUM(duration_seconds) AS total
+            FROM afk_sessions {where} GROUP BY user_id ORDER BY total DESC LIMIT 10""", params).fetchall()
+    label = {"today":"Today","week":"This week","month":"This month","all":"All time"}[selected]
+    if not rows:
+        await interaction.response.send_message(f"No completed Wigz AFK sessions for **{label}** yet.")
+        return
+    maximum = rows[0][2]
+    medals = ["🥇", "🥈", "🥉"]
+    lines = []
+    for index, (_, name, seconds) in enumerate(rows):
+        rank = medals[index] if index < 3 else f"#{index + 1}"
+        lines.append(f"### {rank}  {name}\n\`{stat_bar(seconds, maximum, 16)}\`  **{format_duration(seconds)}**")
+    embed = discord.Embed(title="💤  A F K   L E A D E R B O A R D",
+        description=f"**{label.upper()}**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n" + "\n\n".join(lines),
+        color=discord.Color.gold())
+    embed.set_footer(text=f"WIGZ • AFK begins after {AFK_INACTIVITY_MINUTES}m of silence")
     await interaction.response.send_message(embed=embed)
 
 
