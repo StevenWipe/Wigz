@@ -77,9 +77,12 @@ def detect_phrases(text: str) -> list[str]:
         if normalized_phrase and f" {normalized_phrase} " in padded:
             matches.append(phrase)
 
+    # Record each distinct matched profanity/slur separately so score and
+    # leaderboard breakdowns can show exactly which word was detected.
+    # Repeating the same word within one utterance still counts only once.
     words = set(normalized.split())
-    if words.intersection(PROFANITY_AND_SLURS):
-        matches.append("profanity/slur")
+    for term in sorted(words.intersection(PROFANITY_AND_SLURS)):
+        matches.append(term)
 
     return matches
 
