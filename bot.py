@@ -559,31 +559,30 @@ async def stats(interaction: discord.Interaction, member: discord.Member | None 
         description=f"## {target.display_name}\nLifetime trigger report",
         color=discord.Color.from_rgb(88, 101, 242),
     )
-    embed.add_field(name="Today", value=f"**{today}**", inline=True)
-    embed.add_field(name="This week", value=f"**{week}**", inline=True)
-    embed.add_field(name="This month", value=f"**{month}**", inline=True)
-    embed.add_field(name="All time", value=f"**{total}**", inline=True)
-    embed.add_field(
-        name="🏅 ALL-TIME FAVORITE",
-        value=f"**{display_trigger(favorite)}**\n{favorite_count} hits",
-        inline=True,
+    overview = (
+        f"**TODAY**  {today}    •    **WEEK**  {week}\n"
+        f"**MONTH**  {month}    •    **ALL TIME**  {total}"
     )
-    embed.add_field(
-        name="☀️ WORD OF THE DAY",
-        value=f"**{display_trigger(top_today[0])}**\n{top_today[1]} hits" if top_today else "No triggers yet",
-        inline=True,
+    hot_words = (
+        f"☀️ **TODAY**  {display_trigger(top_today[0])} · {top_today[1] if top_today else 0}\n"
+        if top_today else "☀️ **TODAY**  —\n"
     )
-    embed.add_field(
-        name="📅 WORD OF THE WEEK",
-        value=f"**{display_trigger(top_week[0])}**\n{top_week[1]} hits" if top_week else "No triggers yet",
-        inline=True,
+    hot_words += (
+        f"📅 **WEEK**  {display_trigger(top_week[0])} · {top_week[1]}\n"
+        if top_week else "📅 **WEEK**  —\n"
     )
-    embed.add_field(
-        name="🗓️ WORD OF THE MONTH",
-        value=f"**{display_trigger(top_month[0])}**\n{top_month[1]} hits" if top_month else "No triggers yet",
-        inline=True,
+    hot_words += (
+        f"🗓️ **MONTH**  {display_trigger(top_month[0])} · {top_month[1]}"
+        if top_month else "🗓️ **MONTH**  —"
     )
-    embed.add_field(name="🔥 TOP TRIGGERS", value=breakdown, inline=False)
+    embed.add_field(name="📊  SCOREBOARD", value=overview, inline=False)
+    embed.add_field(
+        name="🏅  SIGNATURE WORD",
+        value=f"### {display_trigger(favorite)}\n**{favorite_count} lifetime hits**",
+        inline=False,
+    )
+    embed.add_field(name="🔥  HOT WORDS", value=hot_words, inline=False)
+    embed.add_field(name="📈  TRIGGER BREAKDOWN", value=breakdown, inline=False)
     embed.set_thumbnail(url=member_avatar_url(target))
     embed.set_footer(text="WIGZ • Every word leaves a mark")
     await interaction.response.send_message(embed=embed)
@@ -635,18 +634,27 @@ async def leaderboard(
         await interaction.response.send_message(f"No Wigz trigger scores for **{label}** yet.")
         return
 
+    max_points = max(points for _, _, points, _ in sections)
+    lines = []
+    for medal, name, points, breakdown in sections:
+        bar = stat_bar(points, max_points, 16)
+        lines.append(
+            f"### {medal}  {name}\n"
+            f"\`{bar}\`  **{points} HITS**\n"
+            f"{breakdown or 'No trigger breakdown'}"
+        )
+
     embed = discord.Embed(
-        title="🏆 WIGZ • LEADERBOARD",
-        description=f"## {label.upper()}\nWho can't keep their mouth shut?",
+        title="🏆  W I G Z   L E A D E R B O A R D",
+        description=(
+            f"**{label.upper()}**\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            + "\n\n".join(lines)
+            + "\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        ),
         color=discord.Color.gold(),
     )
-    for medal, name, points, breakdown in sections:
-        embed.add_field(
-            name=f"{medal}  {name.upper()}  •  {points} HITS",
-            value=breakdown or "No trigger breakdown",
-            inline=False,
-        )
-    embed.set_footer(text="WIGZ • Rankings update live")
+    embed.set_footer(text="WIGZ  •  Rankings update live")
     await interaction.response.send_message(embed=embed)
 
 
@@ -685,41 +693,37 @@ async def recap(interaction: discord.Interaction):
             (interaction.guild_id, cutoff),
         ).fetchall()
 
+    top_word_text = (
+        f"**{display_trigger(top_word[0])}**\n### {top_word[1]} HITS"
+        if top_word else "No triggers yet"
+    )
+    if leaders:
+        medals = ["🥇", "🥈", "🥉"]
+        standings = "\n".join(
+            f"{medals[index]}  **{name}**  ·  **{points}**"
+            for index, (_, name, points) in enumerate(leaders)
+        )
+        mvp_text = f"**{leaders[0][1]}**\n### {leaders[0][2]} HITS"
+    else:
+        standings = "No scores yet"
+        mvp_text = "Nobody yet"
+
     embed = discord.Embed(
-        title="⚡ WIGZ • DAILY RECAP",
-        description="## TODAY'S DAMAGE REPORT\nThe server-wide scoreboard so far.",
+        title="⚡  W I G Z   •   D A I L Y   R E C A P",
+        description=(
+            "## TODAY'S DAMAGE REPORT\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"# {total}\n"
+            "**TOTAL HITS TODAY**\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        ),
         color=discord.Color.gold(),
         timestamp=datetime.now(timezone.utc),
     )
-
-    embed.add_field(name="🎯 TOTAL HITS", value=f"**{total}**", inline=True)
-
-    if top_word:
-        embed.add_field(
-            name="🗣️ WORD OF THE DAY",
-            value=f"**{top_word[0].title()}** — {top_word[1]}",
-            inline=True,
-        )
-    else:
-        embed.add_field(name="🗣️ Word of the Day", value="No triggers yet", inline=True)
-
-    if leaders:
-        embed.add_field(
-            name="👑 TODAY'S MVP",
-            value=f"**{leaders[0][1]}** — {leaders[0][2]}",
-            inline=True,
-        )
-        medals = ["🥇", "🥈", "🥉"]
-        standings = "\n".join(
-            f"{medals[index]} **{name}** — {points}"
-            for index, (_, name, points) in enumerate(leaders)
-        )
-        embed.add_field(name="🏆 PODIUM", value=standings, inline=False)
-    else:
-        embed.add_field(name="👑 Today's #1", value="Nobody yet", inline=True)
-        embed.add_field(name="🏆 Today's Top 3", value="No scores yet", inline=False)
-
-    embed.set_footer(text="WIGZ • Daily board resets at midnight Pacific")
+    embed.add_field(name="🔥  WORD OF THE DAY", value=top_word_text, inline=False)
+    embed.add_field(name="👑  TODAY'S MVP", value=mvp_text, inline=False)
+    embed.add_field(name="🏆  TODAY'S PODIUM", value=standings, inline=False)
+    embed.set_footer(text="WIGZ  •  Resets at midnight Pacific")
     await interaction.response.send_message(embed=embed)
 
 
