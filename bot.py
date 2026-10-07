@@ -3,6 +3,7 @@ import io
 import logging
 import tempfile
 import os
+import re
 import threading
 import wave
 from collections import defaultdict
@@ -32,6 +33,28 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL", "base.en")
 _whisper_model = None
 _whisper_lock = threading.Lock()
+
+# First detection milestone: edit this list to change tracked words/phrases.
+# Matching is case-insensitive and each phrase can score at most once per utterance.
+TRIGGER_PHRASES = [
+    "fuck",
+    "shit",
+    "damn",
+]
+
+
+def detect_phrases(text: str) -> list[str]:
+    """Return configured phrases found in one transcript, once per phrase."""
+    normalized = re.sub(r"[^a-z0-9']+", " ", text.lower()).strip()
+    padded = f" {normalized} "
+
+    matches = []
+    for phrase in TRIGGER_PHRASES:
+        normalized_phrase = re.sub(r"[^a-z0-9']+", " ", phrase.lower()).strip()
+        if normalized_phrase and f" {normalized_phrase} " in padded:
+            matches.append(phrase)
+
+    return matches
 
 
 def get_whisper_model():
@@ -93,6 +116,8 @@ def transcribe_pcm(display_name: str, pcm: bytes) -> None:
                     pass
         if text:
             print(f"[TRANSCRIPT] {display_name}: {text}")
+            for phrase in detect_phrases(text):
+                print(f'[TRIGGER] {display_name} -> "{phrase}"')
         else:
             print(f"[TRANSCRIPT] {display_name}: (no speech detected)")
 
