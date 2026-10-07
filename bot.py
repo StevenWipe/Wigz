@@ -1,8 +1,15 @@
+import asyncio
+import io
+import logging
 import os
+import threading
+import wave
+from collections import defaultdict
 
 import discord
 from discord.ext import commands, voice_recv
 from dotenv import load_dotenv
+from faster_whisper import WhisperModel
 
 load_dotenv()
 
@@ -10,51 +17,137 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 if not TOKEN:
     raise RuntimeError("DISCORD_TOKEN was not found in .env")
 
+# Keep the experimental voice-receive library's protocol chatter out of the
+# console while still allowing real warnings/errors through.
+logging.getLogger("discord.ext.voice_recv.gateway").setLevel(logging.WARNING)
+logging.getLogger("discord.ext.voice_recv.reader").setLevel(logging.WARNING)
+
 intents = discord.Intents.default()
 intents.members = True
 intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL", "base.en")
+_whisper_model = None
+_whisper_lock = threading.Lock()
 
-class SpeakerActivitySink(voice_recv.AudioSink):
-    """Minimal sink used to prove Wigz can attribute incoming voice to members."""
+
+def get_whisper_model():
+    global _whisper_model
+    if _whisper_model is None:
+        with _whisper_lock:
+            if _whisper_model is None:
+                print(f"[WHISPER] Loading {WHISPER_MODEL_SIZE} model...")
+                _whisper_model = WhisperModel(
+                    WHISPER_MODEL_SIZE,
+                    device="cpu",
+                    compute_type="int8",
+                )
+                print("[WHISPER] Model ready.")
+    return _whisper_model
+
+
+def pcm_to_wav_bytes(pcm: bytes) -> bytes:
+    output = io.BytesIO()
+    with wave.open(output, "wb") as wav_file:
+        wav_file.setnchannels(2)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(48000)
+        wav_file.writeframes(pcm)
+    return output.getvalue()
+
+
+def transcribe_pcm(display_name: str, pcm: bytes) -> None:
+    # Ignore extremely short bursts/noise.
+    if len(pcm) < 48000:
+        return
+
+    try:
+        model = get_whisper_model()
+        wav_bytes = pcm_to_wav_bytes(pcm)
+
+        # faster-whisper accepts a binary file-like object through PyAV.
+        audio_file = io.BytesIO(wav_bytes)
+        segments, info = model.transcribe(
+            audio_file,
+            language="en",
+            beam_size=1,
+            vad_filter=True,
+            condition_on_previous_text=False,
+        )
+
+        text = " ".join(segment.text.strip() for segment in segments).strip()
+        if text:
+            print(f"[TRANSCRIPT] {display_name}: {text}")
+        else:
+            print(f"[TRANSCRIPT] {display_name}: (no speech detected)")
+
+    except Exception as exc:
+        print(f"[TRANSCRIBE ERROR] {display_name}: {type(exc).__name__}: {exc}")
+
+
+class TranscriptionSink(voice_recv.AudioSink):
+    """Collect PCM separately per Discord member and transcribe each utterance."""
+
+    def __init__(self):
+        super().__init__()
+        self.buffers = defaultdict(bytearray)
+        self.names = {}
 
     def wants_opus(self) -> bool:
-        # For the speaker-attribution milestone we only need packet activity,
-        # not decoded PCM. Keeping Opus encoded avoids unnecessary decoding.
-        return True
+        # Whisper needs decoded PCM, so this milestone switches decoding back on.
+        return False
 
     def write(self, user, data) -> None:
-        # Receiving packets here proves the voice receive path is active.
-        # We intentionally do not save or process audio yet.
-        pass
+        if user is None or user.bot:
+            return
+
+        pcm = getattr(data, "pcm", None)
+        if not pcm:
+            return
+
+        self.buffers[user.id].extend(pcm)
+        self.names[user.id] = user.display_name
 
     def cleanup(self) -> None:
-        # Required by AudioSink. Nothing is being persisted yet, so there is
-        # nothing to release at this milestone.
-        pass
+        self.buffers.clear()
+        self.names.clear()
 
     @voice_recv.AudioSink.listener()
     def on_voice_member_speaking_start(self, member):
         if member.bot:
             return
+
+        # Start a clean utterance for this member.
+        self.buffers[member.id] = bytearray()
+        self.names[member.id] = member.display_name
         print(f"[SPEAKING] {member.display_name} started speaking")
 
     @voice_recv.AudioSink.listener()
     def on_voice_member_speaking_stop(self, member):
         if member.bot:
             return
+
         print(f"[SPEAKING] {member.display_name} stopped speaking")
+        pcm = bytes(self.buffers.pop(member.id, b""))
+        display_name = self.names.pop(member.id, member.display_name)
+
+        if pcm:
+            threading.Thread(
+                target=transcribe_pcm,
+                args=(display_name, pcm),
+                daemon=True,
+            ).start()
 
 
 def start_voice_listener(voice_client: voice_recv.VoiceRecvClient) -> None:
     if not voice_client.is_listening():
         voice_client.listen(
-            SpeakerActivitySink(),
+            TranscriptionSink(),
             after=lambda error: print(f"[VOICE LISTENER ERROR] {error}") if error else None,
         )
-        print("[VOICE] Speaker activity listener started")
+        print("[VOICE] Speaker listener + local transcription started")
 
 
 @bot.event
