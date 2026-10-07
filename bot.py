@@ -46,6 +46,10 @@ TRIGGER_PHRASES = [
     "trash",
     "ragebait",
     "stinky",
+    "cheating",
+    "cheater",
+    "hacks",
+    "hacking",
 ]
 
 # Keep sensitive vocabulary internal. These are grouped into a single
@@ -441,7 +445,7 @@ async def score(
         rows = conn.execute(
             f"""SELECT trigger, COUNT(*) AS count
                 FROM trigger_events
-                WHERE user_id = ? AND guild_id = ?{extra_where}
+                WHERE user_id = ? AND guild_id = ? AND trigger != 'profanity/slur'{extra_where}
                 GROUP BY trigger
                 ORDER BY count DESC, trigger COLLATE NOCASE""",
             [target.id, interaction.guild_id, *extra_params],
@@ -455,10 +459,16 @@ async def score(
         )
         return
 
-    breakdown = "\n".join(f"• {trigger.title()}: **{count}**" for trigger, count in rows)
-    await interaction.response.send_message(
-        f"📊 **{target.display_name} — {total} total ({label})**\n{breakdown}"
+    breakdown = "\n".join(f"**{trigger.title()}** — {count}" for trigger, count in rows)
+    embed = discord.Embed(
+        title=f"📊 {target.display_name} — Wigz Score",
+        description=f"**{label}**",
+        color=discord.Color.blurple(),
     )
+    embed.add_field(name="Total triggers", value=f"**{total}**", inline=False)
+    embed.add_field(name="Breakdown", value=breakdown, inline=False)
+    embed.set_footer(text="Wigz • Voice Trigger Tracker")
+    await interaction.response.send_message(embed=embed)
 
 
 @bot.tree.command(name="stats", description="Show detailed Wigz stats for a member.")
@@ -468,7 +478,7 @@ async def stats(interaction: discord.Interaction, member: discord.Member | None 
         rows = conn.execute(
             """SELECT trigger, COUNT(*) AS count
                FROM trigger_events
-               WHERE user_id = ? AND guild_id = ?
+               WHERE user_id = ? AND guild_id = ? AND trigger != 'profanity/slur'
                GROUP BY trigger
                ORDER BY count DESC, trigger COLLATE NOCASE""",
             (target.id, interaction.guild_id),
@@ -495,11 +505,23 @@ async def stats(interaction: discord.Interaction, member: discord.Member | None 
         return
 
     favorite, favorite_count = rows[0]
-    await interaction.response.send_message(
-        f"📈 **{target.display_name} — Wigz Stats**\n"
-        f"Today: **{today}** • Week: **{week}** • Month: **{month}** • All time: **{total}**\n"
-        f"Top trigger: **{favorite.title()}** ({favorite_count})"
+    breakdown = "\n".join(f"**{trigger.title()}** — {count}" for trigger, count in rows[:10])
+    embed = discord.Embed(
+        title=f"📈 {target.display_name} — Wigz Stats",
+        color=discord.Color.blurple(),
     )
+    embed.add_field(name="Today", value=f"**{today}**", inline=True)
+    embed.add_field(name="This week", value=f"**{week}**", inline=True)
+    embed.add_field(name="This month", value=f"**{month}**", inline=True)
+    embed.add_field(name="All time", value=f"**{total}**", inline=True)
+    embed.add_field(
+        name="🏅 Top trigger",
+        value=f"**{favorite.title()}** — {favorite_count}",
+        inline=True,
+    )
+    embed.add_field(name="Top trigger breakdown", value=breakdown, inline=False)
+    embed.set_footer(text="Wigz • Voice Trigger Tracker")
+    await interaction.response.send_message(embed=embed)
 
 
 @bot.tree.command(name="leaderboard", description="Show the Wigz trigger leaderboard.")
@@ -521,7 +543,7 @@ async def leaderboard(
         rows = conn.execute(
             f"""SELECT user_id, MAX(display_name), COUNT(*) AS score
                 FROM trigger_events
-                WHERE guild_id = ?{extra_where}
+                WHERE guild_id = ? AND trigger != 'profanity/slur'{extra_where}
                 GROUP BY user_id
                 ORDER BY score DESC, MAX(display_name) COLLATE NOCASE
                 LIMIT 10""",
@@ -533,7 +555,7 @@ async def leaderboard(
             breakdown_rows = conn.execute(
                 f"""SELECT trigger, COUNT(*) AS count
                     FROM trigger_events
-                    WHERE user_id = ? AND guild_id = ?{extra_where}
+                    WHERE user_id = ? AND guild_id = ? AND trigger != 'profanity/slur'{extra_where}
                     GROUP BY trigger
                     ORDER BY count DESC, trigger COLLATE NOCASE""",
                 [user_id, interaction.guild_id, *extra_params],
@@ -541,15 +563,26 @@ async def leaderboard(
             breakdown = " • ".join(
                 f"{trigger.title()}: {count}" for trigger, count in breakdown_rows
             )
-            sections.append(f"**{index}. {name} — {points} total**\n{breakdown}")
+            medal = {1: "🥇", 2: "🥈", 3: "🥉"}.get(index, f"#{index}")
+            sections.append((medal, name, points, breakdown))
 
     if not rows:
         await interaction.response.send_message(f"No Wigz trigger scores for **{label}** yet.")
         return
 
-    await interaction.response.send_message(
-        f"🏆 **Wigz Leaderboard — {label}**\n\n" + "\n\n".join(sections)
+    embed = discord.Embed(
+        title="🏆 Wigz Leaderboard",
+        description=f"**{label}**",
+        color=discord.Color.gold(),
     )
+    for medal, name, points, breakdown in sections:
+        embed.add_field(
+            name=f"{medal} {name} — {points} total",
+            value=breakdown or "No trigger breakdown",
+            inline=False,
+        )
+    embed.set_footer(text="Wigz • Voice Trigger Tracker")
+    await interaction.response.send_message(embed=embed)
 
 
 @bot.tree.command(name="leave", description="Disconnect Wigz from voice.")
