@@ -21,7 +21,9 @@ class SpeakerActivitySink(voice_recv.AudioSink):
     """Minimal sink used to prove Wigz can attribute incoming voice to members."""
 
     def wants_opus(self) -> bool:
-        return False
+        # For the speaker-attribution milestone we only need packet activity,
+        # not decoded PCM. Keeping Opus encoded avoids unnecessary decoding.
+        return True
 
     def write(self, user, data) -> None:
         # Receiving packets here proves the voice receive path is active.
