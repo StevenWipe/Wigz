@@ -1,6 +1,7 @@
 import asyncio
 import io
 import logging
+from logging.handlers import RotatingFileHandler
 import tempfile
 import os
 import re
@@ -18,6 +19,27 @@ from dotenv import load_dotenv
 from faster_whisper import WhisperModel
 
 load_dotenv()
+
+# Keep a persistent rotating log when Wigz runs without a visible console.
+LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+LOG_PATH = os.path.join(LOG_DIR, "wigz.log")
+_file_handler = RotatingFileHandler(
+    LOG_PATH, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+)
+_file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+logging.getLogger().setLevel(logging.INFO)
+logging.getLogger().addHandler(_file_handler)
+
+# Mirror print-based Wigz diagnostics into the persistent log without
+# removing console output during manual development runs.
+_builtin_print = print
+def print(*args, **kwargs):
+    _builtin_print(*args, **kwargs)
+    try:
+        logging.getLogger("wigz").info(" ".join(str(arg) for arg in args))
+    except Exception:
+        pass
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 if not TOKEN:
