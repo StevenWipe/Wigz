@@ -28,6 +28,11 @@ class SpeakerActivitySink(voice_recv.AudioSink):
         # We intentionally do not save or process audio yet.
         pass
 
+    def cleanup(self) -> None:
+        # Required by AudioSink. Nothing is being persisted yet, so there is
+        # nothing to release at this milestone.
+        pass
+
     @voice_recv.AudioSink.listener()
     def on_voice_member_speaking_start(self, member):
         if member.bot:
