@@ -352,13 +352,27 @@ async def join(interaction: discord.Interaction):
 async def score(interaction: discord.Interaction, member: discord.Member | None = None):
     target = member or interaction.user
     with _db_lock, sqlite3.connect(DB_PATH) as conn:
-        total = conn.execute(
-            "SELECT COUNT(*) FROM trigger_events WHERE user_id = ? AND guild_id = ?",
+        rows = conn.execute(
+            """SELECT trigger, COUNT(*) AS count
+               FROM trigger_events
+               WHERE user_id = ? AND guild_id = ?
+               GROUP BY trigger
+               ORDER BY count DESC, trigger COLLATE NOCASE""",
             (target.id, interaction.guild_id),
-        ).fetchone()[0]
+        ).fetchall()
 
+    total = sum(count for _, count in rows)
+    if not rows:
+        await interaction.response.send_message(
+            f"**{target.display_name}** has no Wigz trigger points yet."
+        )
+        return
+
+    breakdown = "\n".join(
+        f"• {trigger.title()}: **{count}**" for trigger, count in rows
+    )
     await interaction.response.send_message(
-        f"**{target.display_name}** has **{total}** Wigz trigger point{'s' if total != 1 else ''}."
+        f"📊 **{target.display_name} — {total} total**\n{breakdown}"
     )
 
 
@@ -379,11 +393,27 @@ async def leaderboard(interaction: discord.Interaction):
         await interaction.response.send_message("No Wigz trigger scores yet.")
         return
 
-    lines = [
-        f"**{index}. {name}** — {points} point{'s' if points != 1 else ''}"
-        for index, (_, name, points) in enumerate(rows, start=1)
-    ]
-    await interaction.response.send_message("🏆 **Wigz Leaderboard**\n" + "\n".join(lines))
+    sections = []
+    with _db_lock, sqlite3.connect(DB_PATH) as conn:
+        for index, (user_id, name, points) in enumerate(rows, start=1):
+            breakdown_rows = conn.execute(
+                """SELECT trigger, COUNT(*) AS count
+                   FROM trigger_events
+                   WHERE user_id = ? AND guild_id = ?
+                   GROUP BY trigger
+                   ORDER BY count DESC, trigger COLLATE NOCASE""",
+                (user_id, interaction.guild_id),
+            ).fetchall()
+            breakdown = " • ".join(
+                f"{trigger.title()}: {count}" for trigger, count in breakdown_rows
+            )
+            sections.append(
+                f"**{index}. {name} — {points} total**\n{breakdown}"
+            )
+
+    await interaction.response.send_message(
+        "🏆 **Wigz Leaderboard**\n\n" + "\n\n".join(sections)
+    )
 
 
 @bot.tree.command(name="leave", description="Disconnect Wigz from voice.")
