@@ -88,6 +88,7 @@ PROFANITY_AND_SLURS = {
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "database", "wigz.db")
 WATCHED_VOICE_CHANNEL_ID = 442196862607425536  # WHO
+RESULTS_CHANNEL_ID = 1557448201349636249  # Wigz stats/results
 LOCAL_TZ = ZoneInfo("America/Los_Angeles")
 _db_lock = threading.Lock()
 AFK_INACTIVITY_MINUTES = 25
@@ -567,6 +568,27 @@ async def join(interaction: discord.Interaction):
             await interaction.response.send_message(message, ephemeral=True)
 
 
+async def send_stats_result(interaction: discord.Interaction, *, embed=None, content=None) -> None:
+    """Post stat/report results in the dedicated Wigz results channel."""
+    channel = interaction.guild.get_channel(RESULTS_CHANNEL_ID) if interaction.guild else None
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(RESULTS_CHANNEL_ID)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            channel = None
+    if not isinstance(channel, discord.TextChannel):
+        await interaction.response.send_message("I couldn't access the configured Wigz results channel.", ephemeral=True)
+        return
+    try:
+        await channel.send(content=content, embed=embed)
+    except discord.Forbidden:
+        await interaction.response.send_message(
+            f"I can't post in {channel.mention}. Please give me View Channel, Send Messages, and Embed Links there.",
+            ephemeral=True)
+        return
+    await interaction.response.send_message(f"✅ Posted to {channel.mention}", ephemeral=True)
+
+
 @bot.tree.command(name="score", description="Show a member's Wigz trigger score.")
 @app_commands.choices(period=[
     app_commands.Choice(name="Today", value="today"),
@@ -613,7 +635,7 @@ async def score(
     embed.add_field(name="📊 TRIGGER BREAKDOWN", value=breakdown, inline=False)
     embed.set_thumbnail(url=member_avatar_url(target))
     embed.set_footer(text="WIGZ • Every word leaves a mark")
-    await interaction.response.send_message(embed=embed)
+    await send_stats_result(interaction, embed=embed)
 
 
 @bot.tree.command(name="stats", description="Show detailed Wigz stats for a member.")
@@ -646,7 +668,7 @@ async def stats(interaction: discord.Interaction, member: discord.Member | None 
         ).fetchone()[0]
 
     if not rows:
-        await interaction.response.send_message(f"**{target.display_name}** has no Wigz stats yet.")
+        await send_stats_result(interaction, content=f"**{target.display_name}** has no Wigz stats yet.")
         return
 
     top_today = get_top_trigger(target.id, interaction.guild_id, "today")
@@ -690,7 +712,7 @@ async def stats(interaction: discord.Interaction, member: discord.Member | None 
     embed.add_field(name="📈  TRIGGER BREAKDOWN", value=breakdown, inline=False)
     embed.set_thumbnail(url=member_avatar_url(target))
     embed.set_footer(text="WIGZ • Every word leaves a mark")
-    await interaction.response.send_message(embed=embed)
+    await send_stats_result(interaction, embed=embed)
 
 
 @bot.tree.command(name="leaderboard", description="Show the Wigz trigger leaderboard.")
@@ -736,7 +758,7 @@ async def leaderboard(
             sections.append((medal, name, points, breakdown))
 
     if not rows:
-        await interaction.response.send_message(f"No Wigz trigger scores for **{label}** yet.")
+        await send_stats_result(interaction, content=f"No Wigz trigger scores for **{label}** yet.")
         return
 
     max_points = max(points for _, _, points, _ in sections)
@@ -760,7 +782,7 @@ async def leaderboard(
         color=discord.Color.gold(),
     )
     embed.set_footer(text="WIGZ  •  Rankings update live")
-    await interaction.response.send_message(embed=embed)
+    await send_stats_result(interaction, embed=embed)
 
 
 @bot.tree.command(name="recap", description="Show today's server-wide Wigz recap.")
@@ -829,7 +851,7 @@ async def recap(interaction: discord.Interaction):
     embed.add_field(name="👑  TODAY'S MVP", value=mvp_text, inline=False)
     embed.add_field(name="🏆  TODAY'S PODIUM", value=standings, inline=False)
     embed.set_footer(text="WIGZ  •  Resets at midnight Pacific")
-    await interaction.response.send_message(embed=embed)
+    await send_stats_result(interaction, embed=embed)
 
 
 @bot.tree.command(name="afk", description="Show a member's Wigz voice-inactivity stats.")
@@ -858,7 +880,7 @@ async def afk(interaction: discord.Interaction, member: discord.Member | None = 
     embed.add_field(name="🚪  AFK TRIPS", value=f"### {all_trips}", inline=True)
     embed.set_thumbnail(url=member_avatar_url(target))
     embed.set_footer(text="WIGZ • Voice inactivity tracker")
-    await interaction.response.send_message(embed=embed)
+    await send_stats_result(interaction, embed=embed)
 
 
 @bot.tree.command(name="afkleaderboard", description="Rank members by Wigz AFK time.")
@@ -877,7 +899,7 @@ async def afkleaderboard(interaction: discord.Interaction, period: app_commands.
             FROM afk_sessions {where} GROUP BY user_id ORDER BY total DESC LIMIT 10""", params).fetchall()
     label = {"today":"Today","week":"This week","month":"This month","all":"All time"}[selected]
     if not rows:
-        await interaction.response.send_message(f"No completed Wigz AFK sessions for **{label}** yet.")
+        await send_stats_result(interaction, content=f"No completed Wigz AFK sessions for **{label}** yet.")
         return
     maximum = rows[0][2]
     medals = ["🥇", "🥈", "🥉"]
@@ -889,7 +911,7 @@ async def afkleaderboard(interaction: discord.Interaction, period: app_commands.
         description=f"**{label.upper()}**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n" + "\n\n".join(lines),
         color=discord.Color.gold())
     embed.set_footer(text=f"WIGZ • AFK begins after {AFK_INACTIVITY_MINUTES}m of silence")
-    await interaction.response.send_message(embed=embed)
+    await send_stats_result(interaction, embed=embed)
 
 
 @bot.tree.command(name="leave", description="Disconnect Wigz from voice.")
