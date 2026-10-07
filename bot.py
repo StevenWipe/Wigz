@@ -1,7 +1,7 @@
 import os
 
 import discord
-from discord.ext import commands
+from discord.ext import commands, voice_recv
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -15,6 +15,39 @@ intents.members = True
 intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+
+class SpeakerActivitySink(voice_recv.AudioSink):
+    """Minimal sink used to prove Wigz can attribute incoming voice to members."""
+
+    def wants_opus(self) -> bool:
+        return False
+
+    def write(self, user, data) -> None:
+        # Receiving packets here proves the voice receive path is active.
+        # We intentionally do not save or process audio yet.
+        pass
+
+    @voice_recv.AudioSink.listener()
+    def on_voice_member_speaking_start(self, member):
+        if member.bot:
+            return
+        print(f"[SPEAKING] {member.display_name} started speaking")
+
+    @voice_recv.AudioSink.listener()
+    def on_voice_member_speaking_stop(self, member):
+        if member.bot:
+            return
+        print(f"[SPEAKING] {member.display_name} stopped speaking")
+
+
+def start_voice_listener(voice_client: voice_recv.VoiceRecvClient) -> None:
+    if not voice_client.is_listening():
+        voice_client.listen(
+            SpeakerActivitySink(),
+            after=lambda error: print(f"[VOICE LISTENER ERROR] {error}") if error else None,
+        )
+        print("[VOICE] Speaker activity listener started")
 
 
 @bot.event
@@ -33,8 +66,10 @@ async def on_ready():
     print(f"Logged in as: {bot.user}")
     print(f"Bot ID: {bot.user.id}")
     print(f"Connected servers: {len(bot.guilds)}")
+
     for guild in bot.guilds:
         print(f"  - {guild.name}")
+
     print()
     print("Wigz is online and ready.")
     print("=" * 45)
@@ -60,22 +95,24 @@ async def join(interaction: discord.Interaction):
 
     try:
         if voice_client is not None:
-            if voice_client.channel == voice_channel:
-                await interaction.response.send_message(
-                    f"I'm already in **{voice_channel.name}**."
-                )
-                return
+            if not isinstance(voice_client, voice_recv.VoiceRecvClient):
+                await voice_client.disconnect()
+                voice_client = await voice_channel.connect(cls=voice_recv.VoiceRecvClient)
+            elif voice_client.channel != voice_channel:
+                await voice_client.move_to(voice_channel)
 
-            await voice_client.move_to(voice_channel)
+            start_voice_listener(voice_client)
             await interaction.response.send_message(
-                f"Moved to **{voice_channel.name}**. 🔊"
+                f"Listening in **{voice_channel.name}**. 🔊"
             )
-            print(f"[VOICE] Moved to {voice_channel.name} in {interaction.guild.name}")
+            print(f"[VOICE] Listening in {voice_channel.name} in {interaction.guild.name}")
             return
 
-        await voice_channel.connect()
+        voice_client = await voice_channel.connect(cls=voice_recv.VoiceRecvClient)
+        start_voice_listener(voice_client)
+
         await interaction.response.send_message(
-            f"Joined **{voice_channel.name}**. 🔊"
+            f"Joined **{voice_channel.name}** and started listening. 🔊"
         )
         print(f"[VOICE] Connected to {voice_channel.name} in {interaction.guild.name}")
 
@@ -108,6 +145,10 @@ async def leave(interaction: discord.Interaction):
         return
 
     channel_name = voice_client.channel.name
+
+    if isinstance(voice_client, voice_recv.VoiceRecvClient) and voice_client.is_listening():
+        voice_client.stop_listening()
+
     await voice_client.disconnect()
     await interaction.response.send_message(f"Left **{channel_name}**. 👋")
     print(f"[VOICE] Disconnected from {channel_name} in {interaction.guild.name}")
