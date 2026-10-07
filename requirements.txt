@@ -4,7 +4,7 @@ aiosignal==1.4.0
 attrs==26.1.0
 cffi==2.1.1
 davey==0.1.6
-discord-ext-voice_recv==0.5.2a179
+discord-ext-voice-recv @ git+https://github.com/rdphillips7/discord-ext-voice-recv.git@ddd2860
 discord.py==2.7.1
 frozenlist==1.8.0
 idna==3.20
