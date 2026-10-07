@@ -1,6 +1,7 @@
 import asyncio
 import io
 import logging
+import tempfile
 import os
 import threading
 import wave
@@ -67,17 +68,29 @@ def transcribe_pcm(display_name: str, pcm: bytes) -> None:
         model = get_whisper_model()
         wav_bytes = pcm_to_wav_bytes(pcm)
 
-        # faster-whisper accepts a binary file-like object through PyAV.
-        audio_file = io.BytesIO(wav_bytes)
-        segments, info = model.transcribe(
-            audio_file,
-            language="en",
-            beam_size=1,
-            vad_filter=True,
-            condition_on_previous_text=False,
-        )
+        # On Windows, the PyAV build used by faster-whisper can mis-handle
+        # BytesIO objects. A short-lived WAV file is more reliable. It is
+        # deleted immediately after transcription and is never retained.
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_audio:
+                temp_audio.write(wav_bytes)
+                temp_path = temp_audio.name
 
-        text = " ".join(segment.text.strip() for segment in segments).strip()
+            segments, info = model.transcribe(
+                temp_path,
+                language="en",
+                beam_size=1,
+                vad_filter=True,
+                condition_on_previous_text=False,
+            )
+            text = " ".join(segment.text.strip() for segment in segments).strip()
+        finally:
+            if temp_path:
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
         if text:
             print(f"[TRANSCRIPT] {display_name}: {text}")
         else:
