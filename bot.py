@@ -4,7 +4,9 @@ import logging
 import tempfile
 import os
 import re
+import sqlite3
 import threading
+from datetime import datetime, timezone
 import wave
 from collections import defaultdict
 
@@ -34,27 +36,92 @@ WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL", "base.en")
 _whisper_model = None
 _whisper_lock = threading.Lock()
 
-# First detection milestone: edit this list to change tracked words/phrases.
-# Matching is case-insensitive and each phrase can score at most once per utterance.
+# Tracked phrases requested for Wigz.
 TRIGGER_PHRASES = [
-    "fuck",
-    "shit",
-    "damn",
+    "cheers",
+    "dabby time",
+    "my bullets do nothing",
+    "trash",
+    "ragebait",
+    "stinky",
 ]
+
+# Keep sensitive vocabulary internal. These are grouped into a single
+# profanity/slur score category instead of being displayed by commands.
+PROFANITY_AND_SLURS = {
+    "fuck", "fucking", "fucked", "fucker", "motherfucker",
+    "shit", "shitty", "bullshit", "damn", "goddamn",
+    "bitch", "bitches", "bastard", "asshole", "dick", "cunt",
+    # Common identity-based slurs are intentionally stored only for detection.
+    "nigger", "nigga", "faggot", "fag", "chink", "gook", "kike",
+    "spic", "wetback", "beaner", "coon", "raghead", "towelhead",
+    "tranny", "retard",
+}
+
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "database", "wigz.db")
+_db_lock = threading.Lock()
+
+
+def normalize_text(text: str) -> str:
+    return re.sub(r"[^a-z0-9']+", " ", text.lower()).strip()
 
 
 def detect_phrases(text: str) -> list[str]:
-    """Return configured phrases found in one transcript, once per phrase."""
-    normalized = re.sub(r"[^a-z0-9']+", " ", text.lower()).strip()
+    """Return each configured trigger/category at most once per utterance."""
+    normalized = normalize_text(text)
     padded = f" {normalized} "
-
     matches = []
+
     for phrase in TRIGGER_PHRASES:
-        normalized_phrase = re.sub(r"[^a-z0-9']+", " ", phrase.lower()).strip()
+        normalized_phrase = normalize_text(phrase)
         if normalized_phrase and f" {normalized_phrase} " in padded:
             matches.append(phrase)
 
+    words = set(normalized.split())
+    if words.intersection(PROFANITY_AND_SLURS):
+        matches.append("profanity/slur")
+
     return matches
+
+
+def init_database() -> None:
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS trigger_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                display_name TEXT NOT NULL,
+                trigger TEXT NOT NULL,
+                occurred_at TEXT NOT NULL,
+                guild_id INTEGER NOT NULL,
+                guild_name TEXT NOT NULL,
+                channel_id INTEGER NOT NULL,
+                channel_name TEXT NOT NULL
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_trigger_events_user ON trigger_events(user_id)"
+        )
+        conn.commit()
+
+
+def record_trigger(user_id: int, display_name: str, trigger: str,
+                   guild_id: int, guild_name: str,
+                   channel_id: int, channel_name: str) -> None:
+    with _db_lock, sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """INSERT INTO trigger_events
+               (user_id, display_name, trigger, occurred_at,
+                guild_id, guild_name, channel_id, channel_name)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                user_id, display_name, trigger,
+                datetime.now(timezone.utc).isoformat(),
+                guild_id, guild_name, channel_id, channel_name,
+            ),
+        )
+        conn.commit()
 
 
 def get_whisper_model():
@@ -82,7 +149,7 @@ def pcm_to_wav_bytes(pcm: bytes) -> bytes:
     return output.getvalue()
 
 
-def transcribe_pcm(display_name: str, pcm: bytes) -> None:
+def transcribe_pcm(user_id: int, display_name: str, guild_id: int, guild_name: str, channel_id: int, channel_name: str, pcm: bytes) -> None:
     # Ignore extremely short bursts/noise.
     if len(pcm) < 48000:
         return
@@ -117,7 +184,11 @@ def transcribe_pcm(display_name: str, pcm: bytes) -> None:
         if text:
             print(f"[TRANSCRIPT] {display_name}: {text}")
             for phrase in detect_phrases(text):
-                print(f'[TRIGGER] {display_name} -> "{phrase}"')
+                record_trigger(
+                    user_id, display_name, phrase,
+                    guild_id, guild_name, channel_id, channel_name,
+                )
+                print(f'[TRIGGER] {display_name} -> "{phrase}" [SAVED]')
         else:
             print(f"[TRANSCRIPT] {display_name}: (no speech detected)")
 
@@ -174,7 +245,15 @@ class TranscriptionSink(voice_recv.AudioSink):
         if pcm:
             threading.Thread(
                 target=transcribe_pcm,
-                args=(display_name, pcm),
+                args=(
+                    member.id,
+                    display_name,
+                    member.guild.id,
+                    member.guild.name,
+                    member.voice.channel.id if member.voice and member.voice.channel else 0,
+                    member.voice.channel.name if member.voice and member.voice.channel else "unknown",
+                    pcm,
+                ),
                 daemon=True,
             ).start()
 
@@ -190,6 +269,8 @@ def start_voice_listener(voice_client: voice_recv.VoiceRecvClient) -> None:
 
 @bot.event
 async def setup_hook():
+    init_database()
+    print(f"[DATABASE] Ready: {DB_PATH}")
     print("Syncing slash commands...")
     synced = await bot.tree.sync()
     print(f"Synced {len(synced)} slash command(s).")
@@ -265,6 +346,44 @@ async def join(interaction: discord.Interaction):
             await interaction.followup.send(message, ephemeral=True)
         else:
             await interaction.response.send_message(message, ephemeral=True)
+
+
+@bot.tree.command(name="score", description="Show a member's Wigz trigger score.")
+async def score(interaction: discord.Interaction, member: discord.Member | None = None):
+    target = member or interaction.user
+    with _db_lock, sqlite3.connect(DB_PATH) as conn:
+        total = conn.execute(
+            "SELECT COUNT(*) FROM trigger_events WHERE user_id = ? AND guild_id = ?",
+            (target.id, interaction.guild_id),
+        ).fetchone()[0]
+
+    await interaction.response.send_message(
+        f"**{target.display_name}** has **{total}** Wigz trigger point{'s' if total != 1 else ''}."
+    )
+
+
+@bot.tree.command(name="leaderboard", description="Show the Wigz trigger leaderboard.")
+async def leaderboard(interaction: discord.Interaction):
+    with _db_lock, sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            """SELECT user_id, MAX(display_name), COUNT(*) AS score
+               FROM trigger_events
+               WHERE guild_id = ?
+               GROUP BY user_id
+               ORDER BY score DESC, MAX(display_name) COLLATE NOCASE
+               LIMIT 10""",
+            (interaction.guild_id,),
+        ).fetchall()
+
+    if not rows:
+        await interaction.response.send_message("No Wigz trigger scores yet.")
+        return
+
+    lines = [
+        f"**{index}. {name}** — {points} point{'s' if points != 1 else ''}"
+        for index, (_, name, points) in enumerate(rows, start=1)
+    ]
+    await interaction.response.send_message("🏆 **Wigz Leaderboard**\n" + "\n".join(lines))
 
 
 @bot.tree.command(name="leave", description="Disconnect Wigz from voice.")
