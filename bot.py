@@ -586,7 +586,8 @@ async def send_stats_result(interaction: discord.Interaction, *, embed=None, con
             f"I can't post in {channel.mention}. Please give me View Channel, Send Messages, and Embed Links there.",
             ephemeral=True)
         return
-    await interaction.response.send_message(f"✅ Posted to {channel.mention}", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    await interaction.delete_original_response()
 
 
 @bot.tree.command(name="score", description="Show a member's Wigz trigger score.")
