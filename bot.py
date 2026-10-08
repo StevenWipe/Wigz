@@ -643,6 +643,86 @@ async def score(
     await send_stats_result(interaction, embed=embed)
 
 
+@bot.tree.command(name="words", description="Show every tracked word and its count for a member.")
+@app_commands.choices(period=[
+    app_commands.Choice(name="Today", value="today"),
+    app_commands.Choice(name="This week", value="week"),
+    app_commands.Choice(name="This month", value="month"),
+    app_commands.Choice(name="All time", value="all"),
+])
+async def words(
+    interaction: discord.Interaction,
+    member: discord.Member | None = None,
+    period: app_commands.Choice[str] | None = None,
+):
+    target = member or interaction.user
+    selected = period.value if period else "all"
+    extra_where, extra_params = period_where(selected)
+    label = {"today": "Today", "week": "This week", "month": "This month", "all": "All time"}[selected]
+    with _db_lock, sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            f"""SELECT trigger, COUNT(*) AS hits FROM trigger_events
+                WHERE user_id = ? AND guild_id = ?
+                  AND trigger != 'profanity/slur'{extra_where}
+                GROUP BY trigger ORDER BY hits DESC, trigger COLLATE NOCASE""",
+            [target.id, interaction.guild_id, *extra_params],
+        ).fetchall()
+
+    if not rows:
+        await send_stats_result(
+            interaction, content=f"**{target.display_name}** has no tracked words for **{label}**.")
+        return
+
+    total = sum(hits for _, hits in rows)
+    lines = [f"**{display_trigger(trigger)}**  —  **{hits}**" for trigger, hits in rows]
+    # Embed descriptions cannot exceed 4096 characters. Split into pages
+    # without dropping any word from the database results.
+    pages, current, length = [], [], 0
+    for line in lines:
+        if current and (length + len(line) + 1 > 3300 or len(current) >= 45):
+            pages.append(current)
+            current, length = [], 0
+        current.append(line)
+        length += len(line) + 1
+    if current:
+        pages.append(current)
+
+    channel = interaction.guild.get_channel(RESULTS_CHANNEL_ID) if interaction.guild else None
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(RESULTS_CHANNEL_ID)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            channel = None
+    if not isinstance(channel, discord.TextChannel):
+        await interaction.response.send_message(
+            "I couldn't access the configured Wigz results channel.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    try:
+        for number, page in enumerate(pages, start=1):
+            embed = discord.Embed(
+                title=f"📖 WIGZ • COMPLETE WORD LIST ({number}/{len(pages)})",
+                description=(
+                    f"## {target.display_name}\\n"
+                    f"**{label.upper()}**  •  **{total} HITS**  •  **{len(rows)} DISTINCT WORDS**\\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\\n\\n"
+                    + "\\n".join(page)
+                ).replace("\\\\n", "\\n"),
+                color=discord.Color.from_rgb(88, 101, 242),
+            )
+            embed.set_footer(text="WIGZ • Full recorded trigger breakdown")
+            if number == 1:
+                embed.set_thumbnail(url=member_avatar_url(target))
+            await channel.send(embed=embed)
+    except (discord.Forbidden, discord.HTTPException):
+        await interaction.followup.send(
+            f"I couldn't post the full report in {channel.mention}. Check my channel permissions.",
+            ephemeral=True)
+        return
+    await interaction.delete_original_response()
+
+
 @bot.tree.command(name="stats", description="Show detailed Wigz stats for a member.")
 async def stats(interaction: discord.Interaction, member: discord.Member | None = None):
     target = member or interaction.user
