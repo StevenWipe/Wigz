@@ -72,6 +72,7 @@ TRIGGER_PHRASES = [
     "cheater",
     "hacks",
     "hacking",
+    "gangbang",
 ]
 
 # Sensitive vocabulary is tracked as individual trigger terms for statistics.
