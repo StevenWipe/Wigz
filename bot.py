@@ -74,8 +74,7 @@ TRIGGER_PHRASES = [
     "hacking",
 ]
 
-# Keep sensitive vocabulary internal. These are grouped into a single
-# profanity/slur score category instead of being displayed by commands.
+# Sensitive vocabulary is tracked as individual trigger terms for statistics.
 PROFANITY_AND_SLURS = {
     "fuck", "fucking", "fucked", "fucker", "motherfucker",
     "shit", "shitty", "bullshit", "damn", "goddamn",
@@ -84,6 +83,9 @@ PROFANITY_AND_SLURS = {
     "nigger", "nigga", "faggot", "fag", "chink", "gook", "kike",
     "spic", "wetback", "beaner", "coon", "raghead", "towelhead",
     "tranny", "retard",
+    "zipperhead", "jungle bunny", "jungle bunnies", "porch monkey",
+    "sand nigger", "camel jockey", "paki", "wog", "slope",
+    "gringo", "honky", "cracker", "redskin", "squaw",
 }
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "database", "wigz.db")
@@ -116,8 +118,10 @@ def detect_phrases(text: str) -> list[str]:
     # leaderboard breakdowns can show exactly which word was detected.
     # Repeating the same word within one utterance still counts only once.
     words = set(normalized.split())
-    for term in sorted(words.intersection(PROFANITY_AND_SLURS)):
-        matches.append(term)
+    for term in sorted(PROFANITY_AND_SLURS):
+        normalized_term = normalize_text(term)
+        if normalized_term and f" {normalized_term} " in padded:
+            matches.append(term)
 
     return matches
 
