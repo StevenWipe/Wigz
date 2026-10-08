@@ -152,6 +152,11 @@ def init_database() -> None:
             afk_started_at TEXT NOT NULL, afk_ended_at TEXT NOT NULL, duration_seconds INTEGER NOT NULL
         )""")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_afk_sessions_user ON afk_sessions(user_id)")
+        conn.execute("""CREATE TABLE IF NOT EXISTS manual_awards (
+            award_key TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            awarded_at TEXT NOT NULL
+        )""")
         conn.commit()
 
 
@@ -471,6 +476,46 @@ async def setup_hook():
     bot.loop.create_task(afk_monitor_loop())
 
 
+async def grant_hedbangr_bonus_once(guild: discord.Guild) -> None:
+    """Give Hedbangr one requested gangbang hit, only once per database."""
+    if guild.name != "Spitshine":
+        return
+    award_key = "hedbangr_gangbang_manual_bonus_v1"
+    with _db_lock, sqlite3.connect(DB_PATH) as conn:
+        if conn.execute("SELECT 1 FROM manual_awards WHERE award_key = ?", (award_key,)).fetchone():
+            return
+
+    matches = [m for m in guild.members if not m.bot and (
+        m.name.casefold() == "hedbangr" or m.display_name.casefold() == "hedbangr")]
+    if len(matches) != 1:
+        try:
+            members = [m async for m in guild.fetch_members(limit=None)]
+            matches = [m for m in members if not m.bot and (
+                m.name.casefold() == "hedbangr" or m.display_name.casefold() == "hedbangr")]
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            print(f"[AWARD] Unable to find Hedbangr: {exc}")
+            return
+    if len(matches) != 1:
+        print(f"[AWARD] Hedbangr bonus pending: {len(matches)} matching members")
+        return
+
+    member = matches[0]
+    now = datetime.now(timezone.utc).isoformat()
+    with _db_lock, sqlite3.connect(DB_PATH) as conn:
+        if conn.execute("SELECT 1 FROM manual_awards WHERE award_key = ?", (award_key,)).fetchone():
+            return
+        conn.execute("""INSERT INTO trigger_events
+            (user_id, display_name, trigger, occurred_at, guild_id, guild_name, channel_id, channel_name)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (member.id, member.display_name, "gangbang", now, guild.id, guild.name,
+             WATCHED_VOICE_CHANNEL_ID, "WHO"))
+        conn.execute(
+            "INSERT INTO manual_awards (award_key, user_id, awarded_at) VALUES (?, ?, ?)",
+            (award_key, member.id, now))
+        conn.commit()
+    print(f"[AWARD] Added exactly one gangbang hit to Hedbangr ({member.id})")
+
+
 @bot.event
 async def on_ready():
     print()
@@ -490,6 +535,7 @@ async def on_ready():
 
     # Keep Wigz parked silently in WHO whenever the bot is online.
     for guild in bot.guilds:
+        await grant_hedbangr_bonus_once(guild)
         await ensure_watched_voice_state(guild)
         channel = guild.get_channel(WATCHED_VOICE_CHANNEL_ID)
         if isinstance(channel, discord.VoiceChannel):
