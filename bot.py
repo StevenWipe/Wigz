@@ -1,4 +1,8 @@
 import asyncio
+import base64
+import subprocess
+import sys
+import audioop
 import time
 import io
 import logging
@@ -102,6 +106,8 @@ _voice_activity = {}
 CHEERS_ALERT_COOLDOWN_SECONDS = 600
 _last_cheers_alert = 0.0
 _cheers_alert_lock = threading.Lock()
+_voice_announcements_enabled = True
+_voice_announcement_lock = asyncio.Lock()
 
 
 def normalize_text(text: str) -> str:
@@ -334,6 +340,69 @@ def pcm_to_wav_bytes(pcm: bytes) -> bytes:
     return output.getvalue()
 
 
+def synthesize_announcer_pcm(message: str) -> bytes:
+    """Use built-in Windows SAPI, returning 48 kHz stereo signed 16-bit PCM."""
+    if sys.platform != "win32":
+        raise RuntimeError("Wigz announcer requires Windows speech synthesis")
+    encoded = base64.b64encode(message.encode("utf-8")).decode("ascii")
+    script = (
+        "Add-Type -AssemblyName System.Speech; "
+        "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
+        "$male = $s.GetInstalledVoices() | Where-Object { $_.VoiceInfo.Gender -eq 'Male' } | Select-Object -First 1; "
+        "if ($male) { $s.SelectVoice($male.VoiceInfo.Name) }; "
+        "$s.Rate = -3; "
+        "$s.Volume = 90; "
+        "$m = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('" + encoded + "')); "
+        "$p = [IO.Path]::GetTempFileName() + '.wav'; "
+        "try { $s.SetOutputToWaveFile($p); $s.Speak($m); $s.SetOutputToNull(); "
+        "[Convert]::ToBase64String([IO.File]::ReadAllBytes($p)) } "
+        "finally { $s.Dispose(); Remove-Item $p -ErrorAction SilentlyContinue }"
+    )
+    result = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True, text=True, timeout=40, check=True,
+    )
+    raw = base64.b64decode(result.stdout.strip())
+    with wave.open(io.BytesIO(raw), "rb") as wav:
+        if wav.getcomptype() != "NONE" or wav.getsampwidth() != 2:
+            raise RuntimeError("Unsupported Windows speech WAV format")
+        channels, rate = wav.getnchannels(), wav.getframerate()
+        pcm = wav.readframes(wav.getnframes())
+    if channels == 2:
+        pcm = audioop.tomono(pcm, 2, 0.5, 0.5)
+    elif channels != 1:
+        raise RuntimeError("Unsupported speech channel count")
+    pcm, _ = audioop.ratecv(pcm, 2, 1, rate, 48000, None)
+    return audioop.tostereo(pcm, 2, 1, 1)
+
+
+async def speak_announcer(guild: discord.Guild, message: str) -> bool:
+    if not _voice_announcements_enabled:
+        return False
+    voice = guild.voice_client
+    if voice is None or voice.channel is None or voice.channel.id != WATCHED_VOICE_CHANNEL_ID:
+        return False
+    async with _voice_announcement_lock:
+        if voice.is_playing():
+            return False
+        try:
+            pcm = await asyncio.to_thread(synthesize_announcer_pcm, message)
+            finished = asyncio.get_running_loop().create_future()
+            loop = asyncio.get_running_loop()
+            def on_finished(error):
+                if not finished.done():
+                    loop.call_soon_threadsafe(finished.set_result, error)
+            voice.play(discord.PCMAudio(io.BytesIO(pcm)), after=on_finished)
+            error = await asyncio.wait_for(finished, timeout=35)
+            if error:
+                print("[VOICE ANNOUNCER] Playback error:", error)
+                return False
+            return True
+        except Exception as exc:
+            print("[VOICE ANNOUNCER] Failed:", type(exc).__name__, exc)
+            return False
+
+
 async def post_cheers_alert(guild_id, display_name):
     guild = bot.get_guild(guild_id)
     if guild is None:
@@ -364,6 +433,8 @@ async def post_cheers_alert(guild_id, display_name):
             allowed_mentions=discord.AllowedMentions(everyone=False, users=members, roles=False),
         )
         print("[CHEERS] Alert delivered to", len(members), "WHO members")
+        if _voice_announcements_enabled:
+            asyncio.create_task(speak_announcer(guild, "Attention, Spitshine. A Cheers has been declared. All personnel, prepare for the sacred ritual."))
     except discord.HTTPException as exc:
         print("[CHEERS] Alert failed:", exc)
 
@@ -741,6 +812,31 @@ async def wrapped(interaction: discord.Interaction):
             embed.add_field(name=title, value="**" + discord.utils.escape_markdown(name) + "** • " + value, inline=False)
     embed.set_footer(text="Wigz • Current month to date • AFK excludes ongoing sessions")
     await send_stats_result(interaction, embed=embed)
+
+
+@bot.tree.command(name="wigzvoice", description="Enable or disable Wigz spoken Cheers announcements.")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def wigzvoice(interaction: discord.Interaction, enabled: bool):
+    global _voice_announcements_enabled
+    _voice_announcements_enabled = enabled
+    await interaction.response.send_message(
+        "🎙️ Wigz voice announcements are now **" + ("ON" if enabled else "OFF") + "**.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="wigztest", description="Test Wigz's dramatic announcer voice in WHO.")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def wigztest(interaction: discord.Interaction):
+    if not interaction.guild or not interaction.guild.voice_client:
+        await interaction.response.send_message("Wigz must be connected to WHO first.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    ok = await speak_announcer(interaction.guild, "Attention, Spitshine. This is a test of the Wigz public announcement system. Please remain completely unserious.")
+    await interaction.followup.send(
+        "🎙️ Announcer test played in WHO!" if ok else "Could not play the voice. Check logs\\wigz.log for details.",
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(name="join", description="Have Wigz join your current voice channel.")
