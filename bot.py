@@ -617,6 +617,132 @@ async def on_voice_state_update(member, before, after):
         print(f"[AFK] Stopped tracking {member.display_name}")
 
 
+def award_winners(guild_id: int, period: str):
+    """Compute awards from existing trigger and completed AFK records."""
+    extra, params = period_where(period)
+    with _db_lock, sqlite3.connect(DB_PATH) as conn:
+        trigger_rows = conn.execute(
+            "SELECT user_id, display_name, trigger, COUNT(*) FROM trigger_events "
+            "WHERE guild_id=? AND trigger != 'profanity/slur'" + extra +
+            " GROUP BY user_id, trigger",
+            [guild_id, *params],
+        ).fetchall()
+        cutoff = period_cutoff(period)
+        afk_rows = conn.execute(
+            "SELECT user_id, display_name, SUM(duration_seconds), MAX(duration_seconds), COUNT(*) "
+            "FROM afk_sessions WHERE guild_id=?" +
+            (" AND afk_ended_at>=?" if cutoff else "") +
+            " GROUP BY user_id",
+            [guild_id] + ([cutoff] if cutoff else []),
+        ).fetchall()
+
+    categories = {
+        "🥂 Cheers Champion": lambda w: w == "cheers",
+        "🤬 Potty Mouth": lambda w: w in PROFANITY_AND_SLURS,
+        "🗑️ Professional Hater": lambda w: w in {"trash", "ragebait", "stinky"},
+        "🕵️ Conspiracy Theorist": lambda w: w in {"cheating", "cheater", "hacks", "hacking"},
+        "🎯 Hot Mic MVP": lambda w: True,
+    }
+    winners = {}
+    for title, matches in categories.items():
+        scores = {}
+        for uid, name, word, count in trigger_rows:
+            if matches(word):
+                prior = scores.get(uid, (name, 0))
+                scores[uid] = (name, prior[1] + count)
+        if scores:
+            uid, (name, count) = max(scores.items(), key=lambda item: (item[1][1], -item[0]))
+            winners[title] = (name, count, uid)
+    if afk_rows:
+        uid, name, total, longest, trips = max(afk_rows, key=lambda row: (row[2], -row[0]))
+        winners["🛋️ The Furniture"] = (name, total, uid)
+        uid, name, total, longest, trips = max(afk_rows, key=lambda row: (row[3], -row[0]))
+        winners["💤 Deepest Hibernation"] = (name, longest, uid)
+        uid, name, total, longest, trips = max(afk_rows, key=lambda row: (row[4], -row[0]))
+        winners["👻 Frequent Ghost"] = (name, trips, uid)
+    return winners, trigger_rows, afk_rows
+
+
+@bot.tree.command(name="awards", description="Spitshine's Hot Mic and AFK awards.")
+@app_commands.choices(period=[
+    app_commands.Choice(name="Today", value="today"),
+    app_commands.Choice(name="This week", value="week"),
+    app_commands.Choice(name="This month", value="month"),
+    app_commands.Choice(name="All time", value="all"),
+])
+async def awards(interaction: discord.Interaction, period: app_commands.Choice[str] | None = None):
+    selected = period.value if period else "month"
+    winners, _, _ = award_winners(interaction.guild_id, selected)
+    embed = discord.Embed(
+        title="🏆 SPITSHINE • HOT MIC AWARDS",
+        description="The crew's completely unofficial hall of fame.\nPeriod: **" + selected.title() + "**",
+        color=discord.Color.gold(),
+    )
+    if not winners:
+        embed.add_field(name="No awards yet", value="Get into WHO and start talking!", inline=False)
+    for title, (name, amount, uid) in winners.items():
+        value = format_duration(amount) if title in ("🛋️ The Furniture", "💤 Deepest Hibernation") else str(amount)
+        embed.add_field(name=title, value="**" + discord.utils.escape_markdown(name) + "** • " + value, inline=False)
+    embed.set_footer(text="Wigz • Based on recorded triggers and completed AFK sessions")
+    await send_stats_result(interaction, embed=embed)
+
+
+@bot.tree.command(name="cheerschampion", description="See who calls Cheers most often.")
+@app_commands.choices(period=[
+    app_commands.Choice(name="This week", value="week"),
+    app_commands.Choice(name="This month", value="month"),
+    app_commands.Choice(name="All time", value="all"),
+])
+async def cheerschampion(interaction: discord.Interaction, period: app_commands.Choice[str] | None = None):
+    selected = period.value if period else "month"
+    extra, params = period_where(selected)
+    with _db_lock, sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT user_id, MAX(display_name), COUNT(*) FROM trigger_events "
+            "WHERE guild_id=? AND trigger='cheers'" + extra +
+            " GROUP BY user_id ORDER BY COUNT(*) DESC LIMIT 15",
+            [interaction.guild_id, *params],
+        ).fetchall()
+    embed = discord.Embed(
+        title="🥂 SPITSHINE • CHEERS CHAMPION",
+        description="**" + selected.title() + "**\n" +
+        ("\n".join(str(i) + ". **" + discord.utils.escape_markdown(name) + "** — " + str(count) + " Cheers"
+                   for i, (_, name, count) in enumerate(rows, 1))
+         if rows else "Nobody has called Cheers yet."),
+        color=discord.Color.green(),
+    )
+    embed.set_footer(text="Counts recorded Cheers, not just notification alerts")
+    await send_stats_result(interaction, embed=embed)
+
+
+@bot.tree.command(name="wrapped", description="Spitshine's monthly Wigz recap.")
+async def wrapped(interaction: discord.Interaction):
+    winners, trigger_rows, afk_rows = award_winners(interaction.guild_id, "month")
+    totals = {}
+    for uid, name, word, count in trigger_rows:
+        totals[word] = totals.get(word, 0) + count
+    total_hits = sum(totals.values())
+    top_words = sorted(totals.items(), key=lambda item: (-item[1], item[0]))[:7]
+    embed = discord.Embed(
+        title="📀 SPITSHINE • MONTHLY WRAPPED",
+        description="**" + datetime.now(LOCAL_TZ).strftime("%B %Y") +
+                    "**\nA month of questionable decisions, documented by Wigz.",
+        color=discord.Color.from_rgb(88, 101, 242),
+    )
+    embed.add_field(name="🎯 Recorded hits", value=str(total_hits), inline=True)
+    embed.add_field(name="🎙️ Tracked speakers", value=str(len({row[0] for row in trigger_rows})), inline=True)
+    embed.add_field(name="🔥 Top phrases", value="\n".join(
+        "**" + display_trigger(word) + "** — " + str(count) for word, count in top_words
+    ) if top_words else "Nothing recorded yet.", inline=False)
+    for title in ("🥂 Cheers Champion", "🎯 Hot Mic MVP", "🛋️ The Furniture"):
+        if title in winners:
+            name, amount, uid = winners[title]
+            value = format_duration(amount) if title == "🛋️ The Furniture" else str(amount)
+            embed.add_field(name=title, value="**" + discord.utils.escape_markdown(name) + "** • " + value, inline=False)
+    embed.set_footer(text="Wigz • Current month to date • AFK excludes ongoing sessions")
+    await send_stats_result(interaction, embed=embed)
+
+
 @bot.tree.command(name="join", description="Have Wigz join your current voice channel.")
 async def join(interaction: discord.Interaction):
     if interaction.guild is None:
