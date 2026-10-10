@@ -1,4 +1,5 @@
 import asyncio
+import time
 import io
 import logging
 from logging.handlers import RotatingFileHandler
@@ -98,6 +99,9 @@ AFK_INACTIVITY_MINUTES = 25
 AFK_THRESHOLD_SECONDS = AFK_INACTIVITY_MINUTES * 60
 _voice_activity_lock = threading.Lock()
 _voice_activity = {}
+CHEERS_ALERT_COOLDOWN_SECONDS = 60
+_last_cheers_alert = 0.0
+_cheers_alert_lock = threading.Lock()
 
 
 def normalize_text(text: str) -> str:
@@ -330,6 +334,52 @@ def pcm_to_wav_bytes(pcm: bytes) -> bytes:
     return output.getvalue()
 
 
+async def post_cheers_alert(guild_id, display_name):
+    guild = bot.get_guild(guild_id)
+    if guild is None:
+        return
+    voice = guild.get_channel(WATCHED_VOICE_CHANNEL_ID)
+    if not isinstance(voice, discord.VoiceChannel):
+        return
+    members = [m for m in voice.members if not m.bot]
+    if not members:
+        return
+    channel = guild.get_channel(RESULTS_CHANNEL_ID)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(RESULTS_CHANNEL_ID)
+        except discord.HTTPException as exc:
+            print("[CHEERS] Cannot find results channel:", exc)
+            return
+    embed = discord.Embed(
+        title="🌿 CHEERS, SPITSHINE! 🥂",
+        description="**" + discord.utils.escape_markdown(display_name) + "** called CHEERS!\n\n💨 Raise your bowls and ready your dabs!",
+        color=discord.Color.green(),
+    )
+    embed.set_footer(text="Wigz • Cheers alert • 60-second cooldown")
+    try:
+        await channel.send(
+            content="🔔 **CHEERS ALERT — WHO**\n" + " ".join(m.mention for m in members),
+            embed=embed,
+            allowed_mentions=discord.AllowedMentions(everyone=False, users=members, roles=False),
+        )
+        print("[CHEERS] Alert delivered to", len(members), "WHO members")
+    except discord.HTTPException as exc:
+        print("[CHEERS] Alert failed:", exc)
+
+
+def queue_cheers_alert(guild_id, display_name):
+    global _last_cheers_alert
+    if not bot.is_ready() or bot.loop.is_closed():
+        return
+    now = time.monotonic()
+    with _cheers_alert_lock:
+        if now - _last_cheers_alert < CHEERS_ALERT_COOLDOWN_SECONDS:
+            return
+        _last_cheers_alert = now
+    asyncio.run_coroutine_threadsafe(post_cheers_alert(guild_id, display_name), bot.loop)
+
+
 def transcribe_pcm(user_id: int, display_name: str, guild_id: int, guild_name: str, channel_id: int, channel_name: str, pcm: bytes) -> None:
     # Ignore extremely short bursts/noise.
     if len(pcm) < 48000:
@@ -370,6 +420,8 @@ def transcribe_pcm(user_id: int, display_name: str, guild_id: int, guild_name: s
                     guild_id, guild_name, channel_id, channel_name,
                 )
                 print(f'[TRIGGER] {display_name} -> "{phrase}" [SAVED]')
+                if phrase == "cheers" and channel_id == WATCHED_VOICE_CHANNEL_ID:
+                    queue_cheers_alert(guild_id, display_name)
         else:
             print(f"[TRANSCRIPT] {display_name}: (no speech detected)")
 
