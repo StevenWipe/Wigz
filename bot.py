@@ -99,7 +99,7 @@ AFK_INACTIVITY_MINUTES = 25
 AFK_THRESHOLD_SECONDS = AFK_INACTIVITY_MINUTES * 60
 _voice_activity_lock = threading.Lock()
 _voice_activity = {}
-CHEERS_ALERT_COOLDOWN_SECONDS = 60
+CHEERS_ALERT_COOLDOWN_SECONDS = 600
 _last_cheers_alert = 0.0
 _cheers_alert_lock = threading.Lock()
 
@@ -356,7 +356,7 @@ async def post_cheers_alert(guild_id, display_name):
         description="**" + discord.utils.escape_markdown(display_name) + "** called CHEERS!\n\n💨 Raise your bowls and ready your dabs!",
         color=discord.Color.green(),
     )
-    embed.set_footer(text="Wigz • Cheers alert • 60-second cooldown")
+    embed.set_footer(text="Wigz • Cheers alert • 10-minute cooldown")
     try:
         await channel.send(
             content="🔔 **CHEERS ALERT — WHO**\n" + " ".join(m.mention for m in members),
